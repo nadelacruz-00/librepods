@@ -1,0 +1,143 @@
+name: Build Linux aarch64
+
+# Builds the upstream LibrePods Rust app (linux/rust branch) natively on an
+# arm64 runner and publishes it as the rolling "linux-aarch64-latest" release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: Repository to build from
+        default: librepods-org/librepods
+      upstream_ref:
+        description: Branch, tag or SHA to build
+        default: linux/rust
+      force:
+        description: Rebuild even if this commit was already released
+        type: boolean
+        default: false
+  schedule:
+    - cron: '17 6 * * 1' # weekly, Monday 06:17 UTC
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/aarch64-linux.yml'
+      - 'packaging/linux-aarch64/**'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-linux-aarch64
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: ${{ inputs.upstream_repo || 'librepods-org/librepods' }}
+  UPSTREAM_REF: ${{ inputs.upstream_ref || 'linux/rust' }}
+  RELEASE_TAG: linux-aarch64-latest
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Resolve upstream commit
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(gh api "repos/$UPSTREAM_REPO/commits/$UPSTREAM_REF" --jq .sha)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:7}" >> "$GITHUB_OUTPUT"
+
+          released=$(gh release view "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --json body --jq .body 2>/dev/null \
+            | grep -oE 'upstream-sha: [0-9a-f]{40}' | cut -d' ' -f2 || true)
+          if [[ "$released" == "$sha" && "${{ github.event_name }}" == "schedule" ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Upstream $sha already released; skipping."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout packaging files
+        if: steps.upstream.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          path: fork
+          sparse-checkout: packaging/linux-aarch64
+
+      - name: Checkout upstream source
+        if: steps.upstream.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ steps.upstream.outputs.sha }}
+          path: src
+
+      - name: Install dependencies
+        if: steps.upstream.outputs.skip != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libdbus-1-dev libpulse-dev
+
+      - name: Install Rust
+        if: steps.upstream.outputs.skip != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        if: steps.upstream.outputs.skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/linux-rust/target
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('src/linux-rust/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-
+
+      - name: Build
+        if: steps.upstream.outputs.skip != 'true'
+        working-directory: src/linux-rust
+        run: cargo build --release --locked
+
+      - name: Package
+        if: steps.upstream.outputs.skip != 'true'
+        id: pkg
+        run: |
+          version=$(grep -m1 '^version' src/linux-rust/Cargo.toml | cut -d'"' -f2)
+          name="librepods-${version}-${{ steps.upstream.outputs.short }}-linux-aarch64"
+          mkdir -p "dist/$name"
+          cp src/linux-rust/target/release/librepods "dist/$name/"
+          cp src/linux-rust/assets/icon.png "dist/$name/me.kavishdevar.librepods.png"
+          cp src/linux-rust/assets/me.kavishdevar.librepods.desktop "dist/$name/"
+          cp fork/packaging/linux-aarch64/install.sh "dist/$name/"
+          chmod +x "dist/$name/install.sh" "dist/$name/librepods"
+          echo "${version} (${{ steps.upstream.outputs.short }})" > "dist/$name/VERSION"
+          file "dist/$name/librepods"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        if: steps.upstream.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: dist/${{ steps.pkg.outputs.name }}.tar.gz
+
+      - name: Publish rolling release
+        if: steps.upstream.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=${{ steps.upstream.outputs.sha }}
+          gh release delete "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" --cleanup-tag -y 2>/dev/null || true
+          gh release create "$RELEASE_TAG" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "LibrePods Linux aarch64 (${sha:0:7})" \
+            --notes "Native aarch64 build of [$UPSTREAM_REPO@$UPSTREAM_REF](https://github.com/$UPSTREAM_REPO/commit/$sha).
+
+          Install: download the tarball, extract it, run \`./install.sh\` (installs to \`~/.local\`).
+
+          upstream-sha: $sha" \
+            "dist/${{ steps.pkg.outputs.name }}.tar.gz"
